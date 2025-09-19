@@ -16,7 +16,7 @@ output_model_path = "data/processed/kmeans_model.pkl"
 
 
 # calculate distribution metrics parameters
-n_bins = 20
+n_bins = 20         # bins for radial profiles (0-1 normalized radius)
 outer_width = 0.20  # fraction of radius for outer shell (for radial profile)
 inner_width = 0.20  # fraction of radius for inner shell (for radial profile)
 output_metrics_path = "data/processed/het_metrics.csv"
@@ -28,7 +28,11 @@ output_bin_centers_path = "data/processed/radial_profile_bin_centers.npy"
 
 # plot distribution stats parameters
 path_to_stats_dataframe = "data/processed/het_metrics.csv"
-path_to_radial_profiles = "data/processed/radial_profiles.npy"
-path_to_radial_profile_bin_centers = "data/processed/radial_profile_bin_centers.npy"
+#path_to_radial_profiles = "data/processed/radial_profiles.npy"
+#path_to_radial_profile_bin_centers = "data/processed/radial_profile_bin_centers.npy"
+cond_col="condition",            # default column name
+group_order=["cond_a","cond_b", "cond_c"],  # optional explicit order
+metric_col="odds_ratio",         # or "risk_ratio" if you prefer RP
+title="Chromatin distribution — Control vs Treated"
 plot_metrics_path = "data/figures/het_metrics.png"
 plot_profiles_path = "data/figures/radial_profiles.png" # png or pdf
