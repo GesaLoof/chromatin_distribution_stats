@@ -9,6 +9,8 @@ from sklearn.cluster import KMeans
 from scipy.ndimage import gaussian_filter, uniform_filter, distance_transform_edt
 from scipy.ndimage import binary_opening, binary_closing, generate_binary_structure
 from chromatin_distribution_stats import config
+import os
+from pathlib import Path
 # TODO check imports
 
 def _local_variance(x, size=7):
@@ -164,12 +166,14 @@ def kmeans_heterochromatin_all(
         If return_semantic=True: 0=background, 1=heterochromatin, 2=non-heterochromatin.
     """
     # Normalize nucleus labeling
+    #TODO: also handle binary masks
     if nuclei_mask.dtype == bool:
-        nuc_labels = label(nuclei_mask, connectivity=2)
+        nuc_labels = cc_label(nuclei_mask, connectivity=2)
     else:
         nuc_labels = nuclei_mask.astype(int, copy=False)
 
     H, W = nuc_labels.shape
+    print(f"Found {nuc_labels.max()} nuclei in image of size {H}x{W}")
     het_global    = np.zeros((H, W), dtype=bool)
     labels_global = np.full((H, W), fill_value=-1, dtype=int)
     models = []
@@ -179,7 +183,7 @@ def kmeans_heterochromatin_all(
         L = prop.label
         mask_L = (nuc_labels == L)
 
-        # Run your existing per-nucleus function (exactly as you posted)
+        # Run existing per-nucleus function
         het_L, labels_L, km = _kmeans_heterochromatin(
             img, mask_L,
             K=K,
@@ -229,8 +233,8 @@ def kmeans_heterochromatin_all(
 
 def main():
     # Example usage
-    img = imread("example_em_image.tif")
-    nuc_mask = imread("example_nucleus_mask.tif").astype(bool)
+    img = imread(config.k_input_im_path)
+    nuc_mask = imread(config.k_input_nuc_mask_path).astype(bool)
 
     het_mask, labels_full, model = kmeans_heterochromatin_all(
         img, nuc_mask,
@@ -244,9 +248,20 @@ def main():
         return_semantic=config.return_semantic
     )
 
-    # save results
-    imwrite(config.output_het_mask_path, het_mask.astype(np.uint8))
-    imwrite(config.output_labels_path, labels_full.astype(np.int16))
+    #save results
+    #check if output folder exists, otherwise create it
+    if not os.path.exists(config.output_dir_het_mask_path):
+        os.makedirs(config.output_dir_het_mask_path)
+    #derive name from input image name
+    im_name_stem = Path(config.k_input_im_path).stem
+    print(im_name_stem)
+    imwrite(os.path.join(config.output_dir_het_mask_path, f"{im_name_stem}_het_mask.tif"), het_mask.astype(np.uint8))
+    if config.output_labels_path:
+        imwrite(config.output_labels_path, labels_full.astype(np.int16))
+    if config.output_model_path:
+        import pickle
+        with open(config.output_model_path, 'wb') as f:
+            pickle.dump(model, f)
 
 
     return het_mask, labels_full, model

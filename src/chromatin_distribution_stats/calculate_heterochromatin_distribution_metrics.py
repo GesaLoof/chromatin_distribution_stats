@@ -15,6 +15,7 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 from skimage.measure import label as cc_label, regionprops
+import os
 # TODO check imports
 
 def _normalized_radius(nuc_mask: np.ndarray) -> np.ndarray:
@@ -110,6 +111,7 @@ def hetero_distribution_metrics(
     """
     # Ensure we only analyze pixels inside this nucleus; everything else is ignored.
     het = (het_mask & nuc_mask).astype(bool)
+    print(f"Nucleus mask shape: {nuc_mask.shape}")
     nuc = nuc_mask.astype(bool)
     eu = nuc & (~het)  # euchromatin = nuclear pixels that are not heterochromatin
 
@@ -168,9 +170,15 @@ def hetero_distribution_metrics(
         emd = wasserstein_distance(r[het], r[eu])
 
     # Radial profile by binning nuclear pixels into concentric shells.
+    print(f"Nucleus size (number of pixels): {nuc.sum()}")
+    print(f"Maximum distance inside nucleus: {r.max()}")
+    print(f"Normalized radius values: {r[nuc]}")
     bins = np.linspace(0, 1, n_bins + 1)
-    shell_idx = np.digitize(r[nuc], bins) - 1
+    print(f"{bins=}]")
+    shell_idx = np.digitize(r[nuc], bins, right = True) - 1
+    print(f"{shell_idx=}]")
     het_in_nuc = het[nuc].astype(np.float32)
+    print(f"{het_in_nuc=}]")
     prof = np.array([
         het_in_nuc[shell_idx == i].mean() if np.any(shell_idx == i) else np.nan
         for i in range(n_bins)
@@ -178,7 +186,11 @@ def hetero_distribution_metrics(
     bin_centers = 0.5 * (bins[:-1] + bins[1:])
 
     # Replace NaNs (empty shells) with the global mean to allow AUC computation.
-    prof_valid = np.where(np.isnan(prof), np.nanmean(prof), prof)
+    if np.all(np.isnan(prof)):
+        prof_valid = np.zeros_like(prof)  # Replace all NaNs with 0 if the entire array is NaN
+        print("Warning: radial profile is all NaNs (empty nucleus?)")
+    else:
+        prof_valid = np.where(np.isnan(prof), np.nanmean(prof), prof)
     auc = np.trapz(prof_valid, bin_centers)
 
     # Simple normalized least-squares slope of profile vs radius.
@@ -217,11 +229,14 @@ def hetero_distribution_metrics(
 
 
 def compute_metrics_all(
-    het_global: np.ndarray,
-    nuc_labels: np.ndarray,
+    het_mask_path: str,
+    nuc_mask_path: str,
+    # TODO determine whether we want to bin nuclei or create equally sized groups?
     n_bins: int = 20,
     outer_width: float = 0.20,
     inner_width: float = 0.20,
+    prev_dataframe: pd.DataFrame = None,
+    save_df: bool = False,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """
     Compute per-nucleus heterochromatin distribution metrics across the whole image.
@@ -234,7 +249,7 @@ def compute_metrics_all(
         Nucleus mask. If boolean/0-1, nuclei will be connected-component labeled to 1..N.
         If already integer-labeled, values should be 0=background, 1..N=nuclei.
     n_bins : int, optional (default: 20)
-        Number of concentric shells for the radial profile.
+        Number of concentric shells for the radial profiles.
     outer_width : float, optional (default: 0.20)
         Peripheral shell thickness as fraction of radius (r ∈ [0, outer_width]).
     inner_width : float, optional (default: 0.20)
@@ -255,13 +270,13 @@ def compute_metrics_all(
     Notes
     -----
     - This function does not (re)segment; it just aggregates metrics across labeled nuclei.
-    - Ensure `hetero_distribution_metrics(...)` is defined; it is called once per nucleus.
     """
+    # load images
+    het_global =imread(het_mask_path).astype(bool)
+    nuc_labels = imread(nuc_mask_path).astype(bool)
+
     # Ensure integer-labeled nuclei: 0=background, 1..N=nuclei
-    if nuc_labels.dtype == bool:
-        nuc_labels = cc_label(nuc_labels, connectivity=2)
-    else:
-        nuc_labels = nuc_labels.astype(int, copy=False)
+    nuc_labels = cc_label(nuc_labels, connectivity=2)
 
     rows = []
     profiles = []
@@ -281,35 +296,47 @@ def compute_metrics_all(
             n_bins=n_bins,
         )
 
-        # Attach nucleus id and size
+        # Attach nucleus id and size and source image path
         m["nucleus_id"] = L
         m["area_px"] = int(mask_L.sum())
+        m["path_to_image"] = het_mask_path
 
         rows.append(m)
         profiles.append(m["radial_profile"])
         bin_centers = m["radial_bin_centers"]  # same for all nuclei
 
     # Assemble outputs
-    df = pd.DataFrame(rows).set_index("nucleus_id").sort_index()
-    prof_stack = np.vstack(profiles) if profiles else np.empty((0, n_bins))
+    if prev_dataframe is None: # create new df
+        df = pd.DataFrame(rows)
+        prof_stack = np.vstack(profiles) if profiles else np.empty((0, n_bins))
+    elif prev_dataframe is not None and not config.overwrite_df: # append to previous df
+        df = pd.DataFrame(rows)
+        #append new df to previous df
+        df = pd.concat([prev_dataframe, df], ignore_index=True)
+        prof_stack = np.vstack(profiles) if profiles else np.empty((0, n_bins))
+    else: # overwrite previous df
+        df = pd.DataFrame(rows)
+        prof_stack = np.vstack(profiles) if profiles else np.empty((0, n_bins))
+    
+    # add information about image paths
+    
+    if config.output_metrics_df_path:
+        out_dir = os.path.dirname(config.output_metrics_df_path)
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        df.to_csv(config.output_metrics_df_path, index=False)
+        print(f"Saved metrics dataframe to {config.output_metrics_df_path}")
 
     return df, prof_stack, bin_centers
 
 
 def main():
-    #load heterochromatin and nucleui masks
-    het_mask = imread(config.input_mask_path).astype(bool)
-    nuc_labels = imread(config.input_mask_path).astype(bool)
-
-    df, prof_stack, bin_centers = compute_metrics_all(het_mask, # heterochromatin mask
-                                                      nuc_labels, # nuclei mask
+    _, prof_stack, bin_centers = compute_metrics_all(config.input_het_mask_path, # heterochromatin mask
+                                                      config.input_mask_path, # nuclei mask
                                                       20, # n_bins: int
                                                       0.20, # outer_width: float
                                                       0.20 # inner_width: float
                                                       )
-    
-    #save df
-    df.to_csv(config.output_metrics_path)
     
     if config.save_profiles:
         np.save(config.output_profiles_path, prof_stack)
@@ -319,3 +346,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                                                                                                                  

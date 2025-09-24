@@ -394,16 +394,22 @@ def plot_summary_by_condition(
     return fig, stats
 
 def main():
-        # Example: compare control vs treated (or more groups)
+    # load metrics dataframe
+    metrics_dataframe = pd.read_csv(config.path_to_stats_dataframe)
+    # Example: compare control vs treated (or more groups)
     fig, stats = plot_summary_by_condition(
-        df_all,                          # combined per-nucleus DataFrame from all folders
-        cond_col="condition",            # default column name
-        group_order=["cond_a","cond_b", "cond_c"],  # optional explicit order
-        metric_col="odds_ratio",         # or "risk_ratio" if you prefer RP
-        title="Chromatin distribution — Control vs Treated"
+        metrics_dataframe,               # combined per-nucleus DataFrame from all folders
+        cond_col=config.cond_col,            # default column name
+        group_order=config.group_order,  # optional explicit order
+        metric_col=config.metric_col,         # or "risk_ratio" if you prefer RP
+        title=config.title
     )
-    plt.show()
-    print(stats)
+    fig.savefig(config.plot_metrics_path, dpi=300)
+    print("Saved summary figure to", config.plot_metrics_path)
+    print("Condition summary stats:")
+    for k, v in stats.items():
+        print(f"  {k}: {v}")
+    plt.close(fig)
 
 
 if __name__ == "__main__":
