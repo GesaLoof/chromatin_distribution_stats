@@ -16,39 +16,8 @@ import numpy as np
 import pandas as pd
 from skimage.measure import label as cc_label, regionprops
 import os
+from utils import _normalized_radius, _distance_from_rim
 # TODO check imports
-
-def _normalized_radius(nuc_mask: np.ndarray) -> np.ndarray:
-    """
-    Compute a per-pixel normalized radial coordinate inside ONE nucleus.
-
-    Definition
-    ----------
-    - For each pixel inside the nucleus, compute the Euclidean distance to the nuclear envelope
-      (i.e., to the nearest background pixel) via a distance transform.
-    - Normalize by the maximum interior distance so values fall in [0, 1]:
-        0.0 = nuclear envelope (periphery), 1.0 = deepest interior.
-
-    Parameters
-    ----------
-    nuc_mask : np.ndarray
-        Binary mask for a single nucleus (True/1 inside, False/0 outside).
-        If multiple nuclei are present, run this per nucleus.
-
-    Returns
-    -------
-    r : np.ndarray (float32)
-        Same shape as `nuc_mask`. Values in [0, 1] inside the nucleus; 0 outside.
-        (Outside pixels are set to 0 just as a placeholder—ignore them downstream.)
-    """
-    nuc = nuc_mask.astype(bool)
-    dist_in = distance_transform_edt(nuc)
-
-    r = np.zeros_like(dist_in, dtype=np.float32)
-    if nuc.any():
-        maxd = dist_in[nuc].max()
-        r[nuc] = dist_in[nuc] / (maxd + 1e-8)
-    return r
 
 
 def hetero_distribution_metrics(
@@ -58,10 +27,12 @@ def hetero_distribution_metrics(
     inner_width: float = 0.20,
     n_bins: int = 20,
     eps: float = 1e-8,
-) -> dict:
+    *,
+    shell_mode: str = "normalized",        # "normalized" or "distance"
+    pixel_size: float | None = None,        # add µm/px if you want microns in distance mode
+    condition = config.condition) -> dict:
     """
-    Compute robust, scale-invariant metrics describing how heterochromatin is distributed
-    within a single nucleus (periphery vs interior), given a heterochromatin mask.
+    Compute metrics describing heterochromatin distribution within ONE nucleus.
 
     Parameters
     ----------
@@ -79,6 +50,13 @@ def hetero_distribution_metrics(
         Number of concentric shells for the radial heterochromatin fraction profile.
     eps : float, optional (default: 1e-8)
         Small constant to avoid division by zero in ratio computations.
+
+   Design (hybrid):
+    - Radial profiles, KS/EMD, mean radii are computed on the **normalized radius** r_norm ∈ [0,1]
+      so profiles remain comparable across nuclei.
+    - The **inner/outer shells** used for OR / RP / p_het_* are chosen by:
+        * shell_mode="normalized": outer_width & inner_width are FRACTIONS of radius.
+        * shell_mode="distance"  : outer_width & inner_width are ABSOLUTE THICKNESSES (px or µm).
 
     Returns
     -------
@@ -102,6 +80,8 @@ def hetero_distribution_metrics(
         - "radial_bin_centers": array of length n_bins with the center radius of each shell.
         - "radial_auc": area under the radial profile curve.
         - "radial_slope": simple least-squares slope of the profile vs normalized radius.
+        - "r_max": float (1.0 for normalized; max distance for distance mode)
+        - shell_mode, shell_unit, shell_r_max  (metadata about shell definition)
 
     Notes
     -----
@@ -109,135 +89,144 @@ def hetero_distribution_metrics(
     - The OR and the stabilized RR use Haldane–Anscombe 0.5 pseudocounts (helps when a cell is 0).
     - The normalized radius r has 0 at the nuclear envelope and 1 at the center.
     """
-    # Ensure we only analyze pixels inside this nucleus; everything else is ignored.
+     # Clip to nucleus
     het = (het_mask & nuc_mask).astype(bool)
-    print(f"Nucleus mask shape: {nuc_mask.shape}")
     nuc = nuc_mask.astype(bool)
-    eu = nuc & (~het)  # euchromatin = nuclear pixels that are not heterochromatin
+    eu = nuc & (~het)
 
-    # Normalized radius map inside this nucleus.
-    r = _normalized_radius(nuc)
+    # ---- Profiles & distribution metrics on NORMALIZED radius ----
+    r_norm = _normalized_radius(nuc)  # 0 at rim, 1 at center
 
-    # Define periphery (outer) and core (inner) shells by thresholding r.
-    outer = (r <= outer_width) & nuc
-    inner = (r >= (1.0 - inner_width)) & nuc
-
-    # Fractions of heterochromatin in each shell (naive proportions).
-    p_het_outer = het[outer].mean() if np.any(outer) else np.nan
-    p_het_inner = het[inner].mean() if np.any(inner) else np.nan
-
-    # Naive ratio of proportions (a.k.a. enrichment ratio / RP).
-    enrichment_ratio = p_het_outer / (p_het_inner + eps)
-
-    # 2x2 table counts with 0.5 pseudocounts: (a b; c d)
-    # a = hetero in outer, b = non-hetero in outer, c = hetero in inner, d = non-hetero in inner
-    a = (het & outer).sum() + 0.5
-    b = (eu  & outer).sum() + 0.5
-    c = (het & inner).sum() + 0.5
-    d = (eu  & inner).sum() + 0.5
-
-    # --- Odds Ratio (outer vs inner, event=heterochromatin) ---
-    OR = (a * d) / (b * c)
-    se_logOR = np.sqrt(1/a + 1/b + 1/c + 1/d)
-    logOR = np.log(OR)
-    OR_CI95 = (np.exp(logOR - 1.96 * se_logOR), np.exp(logOR + 1.96 * se_logOR))
-
-    # --- Risk Ratio / Ratio of Proportions (stabilized with pseudocounts) ---
-    # Proportions with the same 0.5 pseudocounts:
-    n_outer = a + b
-    n_inner = c + d
-    p_outer_stab = a / n_outer
-    p_inner_stab = c / n_inner
-    risk_ratio = p_outer_stab / (p_inner_stab + eps)
-
-    # Log-normal CI for RR: Var[log(RR)] ≈ (1/a - 1/n_outer) + (1/c - 1/n_inner)
-    se_logRR = np.sqrt(max(0.0, (1/a - 1/n_outer) + (1/c - 1/n_inner)))
-    logRR = np.log(risk_ratio)
-    RR_CI95 = (np.exp(logRR - 1.96 * se_logRR), np.exp(logRR + 1.96 * se_logRR))
-
-    # Mean radii (lower mean for heterochromatin suggests peripheral localization).
-    mean_r_het = r[het].mean() if het.any() else np.nan
-    mean_r_eu  = r[eu].mean()  if eu.any()  else np.nan
-    mean_r_all = r[nuc].mean() if nuc.any() else np.nan
-    delta_mean_r_het_vs_eu  = (mean_r_het - mean_r_eu) if np.isfinite(mean_r_het) and np.isfinite(mean_r_eu) else np.nan
-    delta_mean_r_het_vs_all = (mean_r_het - mean_r_all) if np.isfinite(mean_r_het) else np.nan
-
-    # Distributional comparisons between r(het) and r(eu): KS statistic and Earth Mover's Distance.
-    ks_D, ks_p = (np.nan, np.nan)
-    emd = np.nan
-    if het.any() and eu.any():
-        ks_D, ks_p = ks_2samp(r[het], r[eu], alternative="two-sided", mode="auto")
-        emd = wasserstein_distance(r[het], r[eu])
-
-    # Radial profile by binning nuclear pixels into concentric shells.
-    print(f"Nucleus size (number of pixels): {nuc.sum()}")
-    print(f"Maximum distance inside nucleus: {r.max()}")
-    print(f"Normalized radius values: {r[nuc]}")
-    bins = np.linspace(0, 1, n_bins + 1)
-    print(f"{bins=}]")
-    shell_idx = np.digitize(r[nuc], bins, right = True) - 1
-    print(f"{shell_idx=}]")
+    # Bins for normalized profile (shared semantics across nuclei)
+    bins_norm = np.linspace(0.0, 1.0, n_bins + 1)
+    shell_idx = np.digitize(r_norm[nuc], bins_norm, right=True) - 1
     het_in_nuc = het[nuc].astype(np.float32)
-    print(f"{het_in_nuc=}]")
+
     prof = np.array([
         het_in_nuc[shell_idx == i].mean() if np.any(shell_idx == i) else np.nan
         for i in range(n_bins)
     ])
-    bin_centers = 0.5 * (bins[:-1] + bins[1:])
+    bin_centers = 0.5 * (bins_norm[:-1] + bins_norm[1:])
 
-    # Replace NaNs (empty shells) with the global mean to allow AUC computation.
+    # AUC & slope on normalized profile
     if np.all(np.isnan(prof)):
-        prof_valid = np.zeros_like(prof)  # Replace all NaNs with 0 if the entire array is NaN
+        prof_valid = np.zeros_like(prof)
         print("Warning: radial profile is all NaNs (empty nucleus?)")
     else:
         prof_valid = np.where(np.isnan(prof), np.nanmean(prof), prof)
     auc = np.trapz(prof_valid, bin_centers)
 
-    # Simple normalized least-squares slope of profile vs radius.
     mask_ok = ~np.isnan(prof)
     if mask_ok.sum() >= 2:
         x = bin_centers[mask_ok]
         y = prof[mask_ok]
-        x = (x - x.mean()) / (x.std() + 1e-8)  # z-score x
+        x = (x - x.mean()) / (x.std() + 1e-8)
         slope = float(np.dot(x, y) / (np.dot(x, x) + 1e-8))
     else:
         slope = np.nan
 
+    # Mean radii (normalized)
+    mean_r_het = r_norm[het].mean() if het.any() else np.nan
+    mean_r_eu  = r_norm[eu].mean()  if eu.any()  else np.nan
+    mean_r_all = r_norm[nuc].mean() if nuc.any() else np.nan
+    delta_mean_r_het_vs_eu  = (mean_r_het - mean_r_eu) if np.isfinite(mean_r_het) and np.isfinite(mean_r_eu) else np.nan
+    delta_mean_r_het_vs_all = (mean_r_het - mean_r_all) if np.isfinite(mean_r_het) else np.nan
+
+    # KS/EMD comparing r_norm distributions
+    ks_D, ks_p = (np.nan, np.nan)
+    emd = np.nan
+    if het.any() and eu.any():
+        ks_D, ks_p = ks_2samp(r_norm[het], r_norm[eu], alternative="two-sided", mode="auto")
+        emd = wasserstein_distance(r_norm[het], r_norm[eu])
+
+    # ---- Shells for OR/RP: pick by normalized or distance semantics ----
+    if shell_mode == "normalized":
+        outer = (r_norm <= outer_width) & nuc
+        inner = (r_norm >= (1.0 - inner_width)) & nuc
+        shell_unit = f"outer_{outer_width}_inner_{inner_width}"
+        shell_r_max = 1.0
+    elif shell_mode == "distance":
+        # distance mode: absolute thickness from rim/center (px or µm)
+        r_dist, rmax_dist, shell_unit = _distance_from_rim(nuc, pixel_size=pixel_size)
+        ow = min(outer_width, rmax_dist/2)  # at most half-radius
+        iw = min(inner_width, rmax_dist/2)
+        outer = (r_dist <= ow) & nuc
+        inner = (r_dist >= (rmax_dist - iw)) & nuc
+        shell_r_max = float(rmax_dist)
+        shell_unit = f"outer_{outer_width}_inner_{inner_width}_px:_{pixel_size if pixel_size is not None else 'px'}"
+
+    p_het_outer = het[outer].mean() if np.any(outer) else np.nan
+    p_het_inner = het[inner].mean() if np.any(inner) else np.nan
+    enrichment_ratio = p_het_outer / (p_het_inner + eps)
+
+    # 2×2 with 0.5 pseudocounts
+    a = (het & outer).sum() + 0.5
+    b = (eu  & outer).sum() + 0.5
+    c = (het & inner).sum() + 0.5
+    d = (eu  & inner).sum() + 0.5
+
+    OR = (a * d) / (b * c)
+    se_logOR = np.sqrt(1/a + 1/b + 1/c + 1/d)
+    logOR = np.log(OR)
+    OR_CI95 = (np.exp(logOR - 1.96 * se_logOR), np.exp(logOR + 1.96 * se_logOR))
+
+    n_outer = a + b
+    n_inner = c + d
+    p_outer_stab = a / n_outer
+    p_inner_stab = c / n_inner
+    risk_ratio = p_outer_stab / (p_inner_stab + eps)
+    se_logRR = np.sqrt(max(0.0, (1/a - 1/n_outer) + (1/c - 1/n_inner)))
+    logRR = np.log(risk_ratio)
+    RR_CI95 = (np.exp(logRR - 1.96 * se_logRR), np.exp(logRR + 1.96 * se_logRR))
+
     return {
+        # proportions / ratios based on the chosen shells
         "p_het_outer": float(p_het_outer),
         "p_het_inner": float(p_het_inner),
-        "enrichment_ratio": float(enrichment_ratio),     # naive RP (no pseudocounts)
-        "risk_ratio": float(risk_ratio),                 # stabilized RP (with pseudocounts)
+        "enrichment_ratio": float(enrichment_ratio),
+        "risk_ratio": float(risk_ratio),
         "risk_ratio_CI95_low": float(RR_CI95[0]),
         "risk_ratio_CI95_high": float(RR_CI95[1]),
         "odds_ratio": float(OR),
         "odds_ratio_CI95_low": float(OR_CI95[0]),
         "odds_ratio_CI95_high": float(OR_CI95[1]),
+
+        # normalized-radius summaries (comparable across nuclei)
         "mean_r_het": float(mean_r_het) if np.isfinite(mean_r_het) else np.nan,
-        "mean_r_eu": float(mean_r_eu) if np.isfinite(mean_r_eu) else np.nan,
+        "mean_r_eu":  float(mean_r_eu)  if np.isfinite(mean_r_eu)  else np.nan,
         "mean_r_all": float(mean_r_all),
-        "delta_mean_r_het_vs_eu": float(delta_mean_r_het_vs_eu) if np.isfinite(delta_mean_r_het_vs_eu) else np.nan,
+        "delta_mean_r_het_vs_eu":  float(delta_mean_r_het_vs_eu)  if np.isfinite(delta_mean_r_het_vs_eu)  else np.nan,
         "delta_mean_r_het_vs_all": float(delta_mean_r_het_vs_all) if np.isfinite(delta_mean_r_het_vs_all) else np.nan,
         "ks_D": float(ks_D) if np.isfinite(ks_D) else np.nan,
         "ks_p": float(ks_p) if np.isfinite(ks_p) else np.nan,
-        "emd": float(emd) if np.isfinite(emd) else np.nan,
-        "radial_profile": prof,                # length n_bins
-        "radial_bin_centers": bin_centers,     # length n_bins
+        "emd": float(emd)   if np.isfinite(emd)   else np.nan,
+
+        # normalized radial profile
+        "radial_profile": prof,
+        "radial_bin_centers": bin_centers,
         "radial_auc": float(auc),
         "radial_slope": float(slope),
+
+        # metadata about shell definition
+        "shell_mode": shell_mode,
+        "shell_unit": shell_unit,
+        "shell_r_max": float(shell_r_max),
+
+        "condition": condition,
     }
 
 
 def compute_metrics_all(
     het_mask_path: str,
     nuc_mask_path: str,
-    # TODO determine whether we want to bin nuclei or create equally sized groups?
     n_bins: int = 20,
     outer_width: float = 0.20,
     inner_width: float = 0.20,
     prev_dataframe: pd.DataFrame = None,
     save_df: bool = False,
-) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    shell_mode: str = "normalized",
+    pixel_size: float | None = None,
+    ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """
     Compute per-nucleus heterochromatin distribution metrics across the whole image.
 
@@ -255,6 +244,15 @@ def compute_metrics_all(
     inner_width : float, optional (default: 0.20)
         Core shell thickness as fraction of radius (r ∈ [1 - inner_width, 1]).
 
+    Radius coordinate
+    -----------------
+    - shell_mode="normalized": r ∈ [0,1], 0 at rim, 1 at center.
+      * outer_width, inner_width are FRACTIONS of radius thickness.
+    - shell_mode="distance": r is distance from rim in px (or µm if pixel_size is given).
+      * outer_width, inner_width are DISTANCES (same unit as r).
+      * Inner shell is the band of thickness `inner_width` closest to the center:
+        r >= (r_max - inner_width).
+
     Returns
     -------
     df : pandas.DataFrame
@@ -271,55 +269,38 @@ def compute_metrics_all(
     -----
     - This function does not (re)segment; it just aggregates metrics across labeled nuclei.
     """
-    # load images
-    het_global =imread(het_mask_path).astype(bool)
+    het_global = imread(het_mask_path).astype(bool)
     nuc_labels = imread(nuc_mask_path).astype(bool)
-
-    # Ensure integer-labeled nuclei: 0=background, 1..N=nuclei
     nuc_labels = cc_label(nuc_labels, connectivity=2)
 
-    rows = []
-    profiles = []
-    bin_centers = None
+    rows, profiles, bin_centers = [], [], None
 
-    # Iterate over each labeled nucleus
     for prop in regionprops(nuc_labels):
         L = prop.label
         mask_L = (nuc_labels == L)
 
-        # Compute metrics for this nucleus (the function will clip het to mask_L)
         m = hetero_distribution_metrics(
             het_mask=het_global,
             nuc_mask=mask_L,
             outer_width=outer_width,
             inner_width=inner_width,
             n_bins=n_bins,
+            shell_mode=shell_mode,          
+            pixel_size=pixel_size,            
         )
 
-        # Attach nucleus id and size and source image path
         m["nucleus_id"] = L
         m["area_px"] = int(mask_L.sum())
         m["path_to_image"] = het_mask_path
 
         rows.append(m)
         profiles.append(m["radial_profile"])
-        bin_centers = m["radial_bin_centers"]  # same for all nuclei
+        bin_centers = m["radial_bin_centers"]
 
-    # Assemble outputs
-    if prev_dataframe is None: # create new df
-        df = pd.DataFrame(rows)
-        prof_stack = np.vstack(profiles) if profiles else np.empty((0, n_bins))
-    elif prev_dataframe is not None and not config.overwrite_df: # append to previous df
-        df = pd.DataFrame(rows)
-        #append new df to previous df
-        df = pd.concat([prev_dataframe, df], ignore_index=True)
-        prof_stack = np.vstack(profiles) if profiles else np.empty((0, n_bins))
-    else: # overwrite previous df
-        df = pd.DataFrame(rows)
-        prof_stack = np.vstack(profiles) if profiles else np.empty((0, n_bins))
-    
-    # add information about image paths
-    
+    # assemble df (same as before)
+    df = pd.DataFrame(rows) if prev_dataframe is None or config.overwrite_df else pd.concat([prev_dataframe, pd.DataFrame(rows)], ignore_index=True)
+    prof_stack = np.vstack(profiles) if profiles else np.empty((0, n_bins))
+
     if config.output_metrics_df_path:
         out_dir = os.path.dirname(config.output_metrics_df_path)
         if not os.path.exists(out_dir):
@@ -330,12 +311,16 @@ def compute_metrics_all(
     return df, prof_stack, bin_centers
 
 
+
 def main():
-    _, prof_stack, bin_centers = compute_metrics_all(config.input_het_mask_path, # heterochromatin mask
-                                                      config.input_mask_path, # nuclei mask
-                                                      20, # n_bins: int
-                                                      0.20, # outer_width: float
-                                                      0.20 # inner_width: float
+    _, prof_stack, bin_centers = compute_metrics_all(config.input_het_mask_path,  # heterochromatin mask path
+                                                    config.input_mask_path,      # nuclei mask path
+                                                    n_bins=20,
+                                                    outer_width=0.20,
+                                                    inner_width=0.20,
+                                                    radius_mode=config.radius_mode,
+                                                    pixel_size=config.pixel_size,
+                                                
                                                       )
     
     if config.save_profiles:

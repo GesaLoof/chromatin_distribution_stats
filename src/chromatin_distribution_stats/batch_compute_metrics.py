@@ -8,12 +8,11 @@ from chromatin_distribution_stats import config
 import os
 import pandas as pd
 import numpy as np
-from tifffile import imread, imwrite
 from calculate_heterochromatin_distribution_metrics import compute_metrics_all
 
 def main():
     # get list of image/mask pairs
-    image_mask_pair_list = _pair_images_and_masks(config.k_batch_input_nuc_mask_dir, 
+    image_mask_pair_list = _pair_images_and_masks(config.input_mask_path, 
                                                   config.batch_input_het_mask_dir, 
                                                   primary_drop_suffix="_mask", 
                                                   pair_drop_suffix="_het_mask")
@@ -26,10 +25,19 @@ def main():
     # loop through nuc/ het mask pairs
     for pair in image_mask_pair_list:
         print(f"Processing pair: {pair[0]} and {pair[1]}")
-        df, _, _ = compute_metrics_all(pair[1],
-                                        pair[0], 
+        df, _, _ = compute_metrics_all( pair[1],
+                                        pair[0],
+                                        save_df = True,
                                         prev_dataframe = df,
-                                        save_df = True)
+                                        n_bins = config.n_bins,
+                                        outer_width = config.outer_width,
+                                        inner_width = config.inner_width,
+                                        shell_mode = config.shell_mode,
+                                        pixel_size = config.pixel_size)
 
 if __name__ == "__main__":
     main()
+
+
+    
+    
