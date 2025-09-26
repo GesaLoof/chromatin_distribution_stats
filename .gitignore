@@ -86,3 +86,7 @@ venv/
 
 # configs
 src/chromatin_distribution_stats/config.py
+
+# data
+data/processed/
+data/figures/
