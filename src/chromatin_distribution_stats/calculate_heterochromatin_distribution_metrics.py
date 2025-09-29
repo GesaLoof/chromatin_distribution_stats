@@ -1,22 +1,17 @@
 import numpy as np
-from scipy.ndimage import distance_transform_edt
-import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
-from scipy.ndimage import distance_transform_edt
+# from scipy.ndimage import distance_transform_edt
 from scipy.stats import ks_2samp, wasserstein_distance
 from skimage.measure import label as cc_label, regionprops
-from tifffile import imread, imwrite
+from tifffile import imread
 from sklearn.cluster import KMeans
-from scipy.ndimage import gaussian_filter, uniform_filter, distance_transform_edt
-from scipy.ndimage import binary_opening, binary_closing, generate_binary_structure
+# from scipy.ndimage import gaussian_filter, uniform_filter, distance_transform_edt
+# from scipy.ndimage import binary_opening, binary_closing, generate_binary_structure
 from chromatin_distribution_stats import config
 from typing import Tuple
-import numpy as np
-import pandas as pd
 from skimage.measure import label as cc_label, regionprops
 import os
-from utils import _normalized_radius, _distance_from_rim
+from chromatin_distribution_stats.utils import _normalized_radius, _distance_from_rim
 # TODO check imports
 
 
@@ -95,6 +90,16 @@ def hetero_distribution_metrics(
     eu = nuc & (~het)
 
     # ---- Profiles & distribution metrics on NORMALIZED radius ----
+    #nuc = np.asarray(nuc_mask)           # the object your test passes
+    print("dtype:", nuc.dtype)
+    print("inside sum:", int((nuc > 0).sum()), "outside sum:", int((nuc == 0).sum()))
+    print("unique values:", np.unique(nuc))
+
+    # Is polarity correct (inside==True)?
+    assert (nuc.dtype == bool) or set(np.unique(nuc)).issubset({0,1}), "Mask must be boolean/binary."
+    assert (nuc >  0).any(), "Empty nucleus mask."
+    assert (nuc == 0).any(), "Mask is full—polarity might be flipped."
+
     r_norm = _normalized_radius(nuc)  # 0 at rim, 1 at center
 
     # Bins for normalized profile (shared semantics across nuclei)
@@ -114,7 +119,7 @@ def hetero_distribution_metrics(
         print("Warning: radial profile is all NaNs (empty nucleus?)")
     else:
         prof_valid = np.where(np.isnan(prof), np.nanmean(prof), prof)
-    auc = np.trapz(prof_valid, bin_centers)
+    auc = np.trapezoid(prof_valid, bin_centers)
 
     mask_ok = ~np.isnan(prof)
     if mask_ok.sum() >= 2:

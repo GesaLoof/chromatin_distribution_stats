@@ -68,13 +68,18 @@ def _normalized_radius(nuc_mask: np.ndarray) -> np.ndarray:
         Same shape as `nuc_mask`. Values in [0, 1] inside the nucleus; 0 outside.
         (Outside pixels are set to 0 just as a placeholder—ignore them downstream.)
     """
-    nuc = nuc_mask.astype(bool)
-    dist_in = distance_transform_edt(nuc)
+    nuc = np.asarray(nuc_mask).astype(bool)
+    if not nuc.any():
+        return np.zeros_like(nuc, dtype=np.float32)
+
+    dist_in = distance_transform_edt(nuc).astype(np.float32)
 
     r = np.zeros_like(dist_in, dtype=np.float32)
-    if nuc.any():
-        maxd = dist_in[nuc].max()
-        r[nuc] = dist_in[nuc] / (maxd + 1e-8)
+    di = dist_in[nuc]
+    dmin = float(di.min())          # typically 1 pixel
+    dmax = float(di.max())
+    denom = max(dmax - dmin, 1e-8)  # guard tiny nuclei
+    r[nuc] = (dist_in[nuc] - dmin) / denom
     return r
 
 

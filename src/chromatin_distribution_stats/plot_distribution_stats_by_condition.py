@@ -2,12 +2,8 @@ from skimage.measure import label as cc_label
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from skimage.measure import label as cc_label, regionprops
-from tifffile import imread, imwrite
-from sklearn.cluster import KMeans
 from chromatin_distribution_stats import config
-from utils import ensure_labeled_nuclei, coerce_profiles_from_csv
-import os
+from chromatin_distribution_stats.utils import coerce_profiles_from_csv
 import ast, re
 from typing import Dict, List, Sequence
 from matplotlib.lines import Line2D
@@ -209,14 +205,6 @@ def _resolve_colors(groups: Sequence[str], colors=None) -> Dict[str, str | None]
             raise ValueError("Not enough colors for groups.")
         return {g: colors[i] for i, g in enumerate(groups)}
     raise TypeError("colors must be None, dict, or list/tuple")
-
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-# Reuse your color helper
-# def _resolve_colors(groups, colors): ...
 
 def plot_rp_summary_by_condition(
     df: pd.DataFrame,
@@ -508,80 +496,62 @@ def plot_profiles_stacked_by_condition(
 
 def _pooled_fixed_effect_from_ci(rr: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> Tuple[float, float, float]:
     """
-    Fixed-effect pooled estimate on log scale using CIs to back out SE.
-    Returns (pooled_rr, pooled_lo, pooled_hi). Drops rows with non-finite inputs.
+    Fixed-effect pooled RP using CIs to infer SE on log scale.
+    Returns (pooled_rr, pooled_lo, pooled_hi). Drops invalid rows.
     """
     rr, lo, hi = np.asarray(rr, float), np.asarray(lo, float), np.asarray(hi, float)
-    mask = np.isfinite(rr) & np.isfinite(lo) & np.isfinite(hi) & (rr > 0) & (lo > 0) & (hi > 0)
-    if mask.sum() == 0:
+    m = np.isfinite(rr) & np.isfinite(lo) & np.isfinite(hi) & (rr > 0) & (lo > 0) & (hi > 0)
+    if m.sum() == 0:
         return np.nan, np.nan, np.nan
-    lrr = np.log(rr[mask])
-    llo = np.log(lo[mask])
-    lhi = np.log(hi[mask])
-    # approximate SE from CI width on log scale
+    lrr, llo, lhi = np.log(rr[m]), np.log(lo[m]), np.log(hi[m])
     se = (lhi - llo) / (2 * 1.96)
-    # guard tiny/zero se
-    se = np.where(se <= 0, np.nan, se)
     ok = np.isfinite(se) & (se > 0)
     if ok.sum() == 0:
         return np.nan, np.nan, np.nan
     w = 1.0 / (se[ok] ** 2)
-    m = np.sum(w * lrr[ok]) / np.sum(w)                  # pooled log-RR
-    se_m = np.sqrt(1.0 / np.sum(w))                      # SE of pooled
-    lo_p = np.exp(m - 1.96 * se_m)
-    hi_p = np.exp(m + 1.96 * se_m)
-    return float(np.exp(m)), float(lo_p), float(hi_p)
+    mhat = np.sum(w * lrr[ok]) / np.sum(w)
+    se_m = np.sqrt(1.0 / np.sum(w))
+    return float(np.exp(mhat)), float(np.exp(mhat - 1.96 * se_m)), float(np.exp(mhat + 1.96 * se_m))
+
 
 def plot_rp_forest_by_condition(
     df: pd.DataFrame,
     cond_col: str = "condition",
     group_order: Optional[List[str]] = None,
     *,
-    rp_col: str = "risk_ratio",                # or "enrichment_ratio"
+    rp_col: str = "risk_ratio",
     lo_col: str = "risk_ratio_CI95_low",
     hi_col: str = "risk_ratio_CI95_high",
-    id_cols: Optional[List[str]] = None,       # columns to build left-hand labels (e.g., ["image_id","nucleus_id"])
-    colors=None,                               # dict or list aligned with group_order
-    max_rows: int = 60,                        # truncate per condition to avoid ultra-tall plots
-    sort_by: str = "abs_log",                  # "value" | "abs_log" | "none"
-    figsize_per_row: float = 0.22,             # height per row (inches)
+    id_cols: Optional[List[str]] = None,
+    colors=None,
+    max_rows: int = 60,
+    sort_by: str = "abs_log",         # "value" | "abs_log" | "none"
+    figsize_per_row: float = 0.22,
     width: float = 7.0,
     title: str = "Forest plot of Ratio of Proportions (RP) by condition",
+    # NEW knobs to match your tests:
+    dedupe_by: Optional[List[str]] = None,
+    filter_query: Optional[str] = None,
+    summary_label: Optional[str] = "pooled",
 ) -> plt.Figure:
     """
-    Forest plot of per-nucleus RP with 95% CIs, one subplot per condition, plus a pooled summary diamond.
-
-    - x-axis is logarithmic; vertical reference at RP=1.
-    - Pooled (fixed-effect) summary is computed from reported CIs (backing out SE on log scale).
+    Forest plot of per-nucleus RP with 95% CIs (log x-axis). One panel per condition, plus pooled summary diamond.
     """
-    assert cond_col in df.columns, f"'{cond_col}' not found"
-    for c in (rp_col, lo_col, hi_col):
-        assert c in df.columns, f"'{c}' not found"
+    # Optional filter (e.g., pick shell_mode)
+    if filter_query:
+        df = df.query(filter_query).copy()
 
+    # Optional de-duplication (e.g., by ["path_to_image","nucleus_id"])
+    if dedupe_by:
+        present = [c for c in dedupe_by if c in df.columns]
+        if present:
+            df = df.drop_duplicates(subset=present, keep="last").copy()
+
+    assert cond_col in df.columns and rp_col in df.columns and lo_col in df.columns and hi_col in df.columns
     groups = group_order or sorted(df[cond_col].dropna().unique().tolist())
     cmap = _resolve_colors(groups, colors)
 
-    # build labels once
-    def _build_label(row) -> str:
-        if not id_cols:
-            # default: try path or nucleus_id if present
-            if "path_to_image" in row and "nucleus_id" in row:
-                return f"{os.path.basename(str(row['path_to_image']))}  (id {int(row['nucleus_id'])})"
-            if "nucleus_id" in row:
-                return f"nucleus {int(row['nucleus_id'])}"
-            return ""
-        parts = []
-        for c in id_cols:
-            if c in row and pd.notna(row[c]):
-                v = row[c]
-                try:
-                    v = int(v)
-                except Exception:
-                    pass
-                parts.append(str(v))
-        return " · ".join(parts)
-
-    # determine global x-limits from all groups (robust range)
+    # global x-lims from all CIs (robust)
     all_lo = pd.to_numeric(df[lo_col], errors="coerce").values
     all_hi = pd.to_numeric(df[hi_col], errors="coerce").values
     all_lo = all_lo[np.isfinite(all_lo) & (all_lo > 0)]
@@ -589,43 +559,48 @@ def plot_rp_forest_by_condition(
     if all_lo.size == 0 or all_hi.size == 0:
         xmin, xmax = 0.5, 2.0
     else:
-        xmin, xmax = float(np.nanpercentile(all_lo, 2)), float(np.nanpercentile(all_hi, 98))
+        xmin = float(np.nanpercentile(all_lo, 2))
+        xmax = float(np.nanpercentile(all_hi, 98))
         if not np.isfinite(xmin) or not np.isfinite(xmax) or xmin <= 0 or xmin >= xmax:
             xmin, xmax = 0.5, 2.0
 
-    # build figure
-    import os
-    nrows_total = 0
-    panels = []
-    per_panel_axes = []
-    # we’ll precompute each panel height
+    # Prepare panels & figure height
+    panels, nrows_total = [], 0
     for g in groups:
         sub = df.loc[df[cond_col] == g].copy()
-        # clean
-        sub[rp_col] = pd.to_numeric(sub[rp_col], errors="coerce")
-        sub[lo_col] = pd.to_numeric(sub[lo_col], errors="coerce")
-        sub[hi_col] = pd.to_numeric(sub[hi_col], errors="coerce")
+        for c in (rp_col, lo_col, hi_col):
+            sub[c] = pd.to_numeric(sub[c], errors="coerce")
         sub = sub[np.isfinite(sub[rp_col]) & np.isfinite(sub[lo_col]) & np.isfinite(sub[hi_col])]
         sub = sub[(sub[rp_col] > 0) & (sub[lo_col] > 0) & (sub[hi_col] > 0)]
-        if sub.empty:
-            panels.append((g, sub, 0))
-            continue
-        # sorting
         if sort_by == "value":
             sub = sub.sort_values(rp_col)
         elif sort_by == "abs_log":
             sub = sub.assign(_abslog=np.abs(np.log(sub[rp_col]))).sort_values("_abslog", ascending=False).drop(columns=["_abslog"])
-        # truncate if too long
-        if max_rows is not None and len(sub) > max_rows:
+        if (max_rows is not None) and (len(sub) > max_rows):
             sub = sub.iloc[:max_rows].copy()
         panels.append((g, sub, len(sub)))
-        nrows_total += len(sub) + 2  # +2 for a bit of breathing room and summary row
+        nrows_total += len(sub) + 2
 
-    # compute figure height
     fig_h = max(2.5, nrows_total * figsize_per_row)
     fig, axes = plt.subplots(len(groups), 1, figsize=(width, fig_h), constrained_layout=True, sharex=True)
     if len(groups) == 1:
         axes = [axes]
+
+    def _build_label(row) -> str:
+        if id_cols:
+            parts = []
+            for c in id_cols:
+                if c in row and pd.notna(row[c]):
+                    v = row[c]
+                    try: v = int(v)
+                    except Exception: pass
+                    parts.append(str(v))
+            return " · ".join(parts)
+        if "path_to_image" in row and "nucleus_id" in row:
+            return f"{os.path.basename(str(row['path_to_image']))}  (id {int(row['nucleus_id'])})"
+        if "nucleus_id" in row:
+            return f"nucleus {int(row['nucleus_id'])}"
+        return ""
 
     for ax, (g, sub, n) in zip(axes, panels):
         ax.set_xscale("log")
@@ -633,40 +608,31 @@ def plot_rp_forest_by_condition(
 
         if n == 0:
             ax.text(0.5, 0.5, f"{g}: no RP with CI", ha="center", va="center", transform=ax.transAxes)
-            ax.set_yticks([])
-            ax.grid(True, which="both", alpha=0.2)
-            ax.set_xlim(xmin, xmax)
-            ax.set_title(f"{g} (N=0)", loc="left")
-            continue
+            ax.set_yticks([]); ax.grid(True, which="both", alpha=0.2)
+            ax.set_xlim(xmin, xmax); ax.set_title(f"{g} (N=0)", loc="left"); continue
 
-        # y positions top->bottom
         y = np.arange(n)[::-1]
-        # draw CIs as horizontal whiskers + point
         col = cmap[g]
         rr = sub[rp_col].values
         lo = sub[lo_col].values
         hi = sub[hi_col].values
+
         ax.hlines(y, lo, hi, color=col, lw=1.6, alpha=0.9)
         ax.plot(rr, y, "o", color=col, ms=4)
 
-        # left labels
         labels = [ _build_label(row) for _, row in sub.iterrows() ]
-        ax.set_yticks(y)
-        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_yticks(y); ax.set_yticklabels(labels, fontsize=8)
         ax.grid(True, which="both", axis="x", alpha=0.2)
 
-        # pooled summary diamond
+        # pooled diamond
         pooled_rr, pooled_lo, pooled_hi = _pooled_fixed_effect_from_ci(rr, lo, hi)
         if np.isfinite(pooled_rr):
-            ysum = -1.2  # a bit below the last row
-            xL, xC, xR = pooled_lo, pooled_rr, pooled_hi
-            # diamond polygon
-            diamond = Polygon(
-                [[xL, ysum], [xC, ysum + 0.4], [xR, ysum], [xC, ysum - 0.4]],
-                closed=True, facecolor=col if col is not None else "C0", alpha=0.5, edgecolor="none"
-            )
+            ysum = -1.2
+            diamond = Polygon([[pooled_lo, ysum], [pooled_rr, ysum+0.4], [pooled_hi, ysum], [pooled_rr, ysum-0.4]],
+                              closed=True, facecolor=(col or "C0"), alpha=0.5, edgecolor="none")
             ax.add_patch(diamond)
-            ax.text(xR*1.02, ysum, "summary", va="center", fontsize=8)
+            if isinstance(summary_label, str) and summary_label.strip():
+                ax.text(pooled_hi * 1.02, ysum, summary_label, va="center", fontsize=8)
 
         ax.set_ylim(-2.0, n - 0.5)
         ax.set_xlim(xmin, xmax)
