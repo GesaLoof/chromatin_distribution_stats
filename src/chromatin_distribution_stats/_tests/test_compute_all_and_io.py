@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from tifffile import imwrite, imread
+from tifffile import imwrite
 from skimage.measure import label as cc_label
 
 from chromatin_distribution_stats.calculate_heterochromatin_distribution_metrics import compute_metrics_all
